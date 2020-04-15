@@ -10,6 +10,38 @@ from PIL import Image
 from tqdm import tqdm
 
 
+# 3x3 convolution
+def conv3x3(in_channels, out_channels, stride=1):
+    return nn.Conv2d(
+        in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False
+    )
+
+
+# Residual block
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = conv3x3(in_channels, out_channels, stride)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(out_channels, out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
 class GuidedFilter(nn.Module):
     def __init__(
         self,
@@ -20,6 +52,9 @@ class GuidedFilter(nn.Module):
         num_iter: int = 50,
         mean_learnable: bool = False,
         agg_learnable: bool = False,
+        guide_learnable: bool = False,
+        a_b_learnable: bool = False,
+        a_b_guide_learnable: bool = False,
     ):
         super().__init__()
         if kernel_sym_size % 2 == 0:
@@ -28,8 +63,19 @@ class GuidedFilter(nn.Module):
         H, W = im_shape
         self.eps = eps
         self.num_iter = num_iter
-        self._a = nn.Parameter(torch.Tensor(im_channels, H, W), requires_grad=False)
-        self._b = nn.Parameter(torch.Tensor(1, H, W), requires_grad=False)
+        self._a = nn.Parameter(
+            torch.Tensor(im_channels, H, W), requires_grad=a_b_learnable
+        )
+        self._b = nn.Parameter(torch.Tensor(1, H, W), requires_grad=a_b_learnable)
+
+        if guide_learnable:
+            self.guide_encoder = torch.nn.Sequential(
+                ResidualBlock(1, 16),
+                ResidualBlock(16, 16),
+                nn.Conv2d(16, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            )
+        else:
+            self.guide_encoder = nn.Identity()
 
         self.mean_filter = self.create_mean_filter(
             im_channels, kernel_sym_size, mean_learnable
@@ -53,21 +99,22 @@ class GuidedFilter(nn.Module):
         return fil
 
     def __call__(self, im_p: torch.Tensor, im_I: torch.Tensor, gt: torch.Tensor = None):
-        self._compute_closed_form_solution(im_p, im_I)
-        if gt is not None:
-            learnable_params = [x for x in self.parameters() if x.requires_grad]
+        guide = im_I
+        self._compute_closed_form_solution(im_p, guide)
+        learnable_params = [x for x in self.parameters() if x.requires_grad]
+        if gt is not None and learnable_params:
             opt = torch.optim.Adam(learnable_params, lr=3e-4)
-
             pbar = tqdm(range(self.num_iter))
             for i in pbar:
-                pred = self.pred(im_I)
-                loss = torch.nn.functional.mse_loss(pred, gt)
-                pbar.set_description(f"MSE loss: {loss}")
-                opt.zero_grad()
+                guide = self.guide_encoder(im_I)
+                pred = self.pred(guide)
+                loss = torch.nn.functional.l1_loss(pred, gt)
+                pbar.set_description(f"L1 loss: {loss}")
                 loss.backward()
                 opt.step()
+                opt.zero_grad()
 
-        return self.pred(im_I)
+        return self.pred(guide)
 
     def _compute_closed_form_solution(self, im_p, im_I):
         corr_II = self.mean_filter(im_I * im_I)
@@ -135,10 +182,10 @@ if __name__ == "__main__":
     gf = GuidedFilter(
         SHAPE,
         eps=1e-5,
-        kernel_sym_size=15,
+        kernel_sym_size=9,
         num_iter=1000,
-        mean_learnable=False,
-        agg_learnable=True,
+        guide_learnable=True,
+        a_b_learnable=True,
     ).to(device)
 
     im_transform = T.Compose(
@@ -161,24 +208,31 @@ if __name__ == "__main__":
         ]
     )
 
-    def normalize(x):
-        mu = x.mean()
-        sigma = x.std()
+    def normalize(x, mu=None, sigma=None):
+        mu = x.mean() if mu is None else mu
+        sigma = x.std() if sigma is None else sigma
         y = x - mu
         y = y / sigma
         return y, mu, sigma
 
     if depth is not None:
-        depth = depth_transform(depth)
         gt_depth = depth_transform(gt_depth)
-        depth, mu_depth, sigma_depth = normalize(depth)
+        depth = depth_transform(depth)
         gt_depth, mu_gt_depth, sigma_gt_depth = normalize(gt_depth)
+        depth, mu_depth, sigma_depth = normalize(depth)
+
         guide = im_transform(guide)
         guide, mu_guide, sigma_guide = normalize(guide)
-        res = gf(depth, guide, gt_depth)
+
+        res = gf(depth, guide, gt=gt_depth)
+
+        vis_show(guide, "Guide", bound=10)
         vis_show(gt_depth, "GT", bound=10)
+        vis_show(depth, "Depth", bound=10)
         vis_show(res, "Result", bound=10)
-        vis_show(torch.abs(res - gt_depth), "Error", bound=10)
+        err = torch.abs(res - gt_depth)
+        vis_show(err, "Error", bound=10)
+        vis.text(f"MAE: {torch.mean(err)}", win="MAE")
 
     else:
         guide = im_transform(guide)
