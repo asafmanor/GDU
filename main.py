@@ -31,9 +31,6 @@ class GuidedFilter(nn.Module):
         self._a = nn.Parameter(torch.Tensor(im_channels, H, W), requires_grad=False)
         self._b = nn.Parameter(torch.Tensor(1, H, W), requires_grad=False)
 
-        # nn.init.normal_(self._a, mean=1.0, std=0.1)
-        # nn.init.normal_(self._b, mean=0.0, std=0.1)
-
         self.mean_filter = self.create_mean_filter(
             im_channels, kernel_sym_size, mean_learnable
         )
@@ -52,10 +49,7 @@ class GuidedFilter(nn.Module):
             padding=kernel_sym_size // 2,
         )
         fil.requires_grad_(learnable)
-        # if learnable:
-        #     nn.init.normal_(fil.weight, mean=1.0, std=0.01)
-        if True:
-            nn.init.constant_(fil.weight, 1.0 / kernel_sym_size ** 2)
+        nn.init.constant_(fil.weight, 1.0 / kernel_sym_size ** 2)
         return fil
 
     def __call__(self, im_p: torch.Tensor, im_I: torch.Tensor, gt: torch.Tensor = None):
@@ -119,14 +113,14 @@ class GuidedFilter(nn.Module):
 
 
 def vis_show(x: torch.Tensor, title: str = "", bound: int = 0):
-    y = x[:, :, bound : SHAPE[0] - bound, bound : SHAPE[1] - bound]
+    y = x[0, :, bound : SHAPE[0] - bound, bound : SHAPE[1] - bound]
     y = y - y.min()
     y = y / y.max()
-    vis.image(y, {"title": title})
+    vis.image(y, win=title, opts={"caption": title})
 
 
 if __name__ == "__main__":
-    vis = visdom.Visdom()
+    vis = visdom.Visdom(port=6006)
 
     guide = Image.open("data/reference.png")
     depth = Image.open("data/target.png")
@@ -137,25 +131,31 @@ if __name__ == "__main__":
     # gt_depth = None
 
     SHAPE = (640, 480)
-
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     gf = GuidedFilter(
         SHAPE,
         eps=1e-5,
         kernel_sym_size=15,
-        num_iter=20,
+        num_iter=1000,
         mean_learnable=False,
         agg_learnable=True,
-    )
+    ).to(device)
 
     im_transform = T.Compose(
-        [T.Grayscale(), T.Resize(SHAPE), T.ToTensor(), lambda x: x.unsqueeze(0),],
+        [
+            T.Grayscale(),
+            T.Resize(SHAPE),
+            T.ToTensor(),
+            lambda x: x.to(dtype=torch.float32, device=device),
+            lambda x: x.unsqueeze(0),
+        ],
     )
 
     depth_transform = T.Compose(
         [
             T.Resize(SHAPE),
             T.ToTensor(),
-            lambda x: x.to(torch.float32),
+            lambda x: x.to(dtype=torch.float32, device=device),
             lambda x: x.unsqueeze(0),
             lambda x: x / 4,
         ]
@@ -178,6 +178,7 @@ if __name__ == "__main__":
         res = gf(depth, guide, gt_depth)
         vis_show(gt_depth, "GT", bound=10)
         vis_show(res, "Result", bound=10)
+        vis_show(torch.abs(res - gt_depth), "Error", bound=10)
 
     else:
         guide = im_transform(guide)
