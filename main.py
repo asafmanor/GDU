@@ -50,17 +50,16 @@ class GuidedFilter(nn.Module):
         kernel_sym_size: int = 3,
         eps: float = 0.01,
         num_iter: int = 50,
-        mean_learnable: bool = False,
-        agg_learnable: bool = False,
         guide_learnable: bool = False,
         a_b_learnable: bool = False,
-        a_b_guide_learnable: bool = False,
     ):
         super().__init__()
         if kernel_sym_size % 2 == 0:
             raise ValueError(f"kernel_sym_size should be odd. got {kernel_sym_size}")
 
         H, W = im_shape
+        self.H = H
+        self.W = W
         self.eps = eps
         self.num_iter = num_iter
         self._a = nn.Parameter(
@@ -69,23 +68,19 @@ class GuidedFilter(nn.Module):
         self._b = nn.Parameter(torch.Tensor(1, H, W), requires_grad=a_b_learnable)
 
         if guide_learnable:
-            self.guide_encoder = torch.nn.Sequential(
-                ResidualBlock(1, 16),
-                ResidualBlock(16, 16),
-                nn.Conv2d(16, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            self.guide_encoder = nn.Sequential(
+                nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=True),
+                ResidualBlock(32, 32),
+                nn.Conv2d(32, 1, kernel_size=3, stride=1, padding=1, bias=True),
             )
         else:
             self.guide_encoder = nn.Identity()
 
-        self.mean_filter = self.create_mean_filter(
-            im_channels, kernel_sym_size, mean_learnable
-        )
-        self.agg_filter = self.create_mean_filter(
-            im_channels, kernel_sym_size, agg_learnable
-        )
+        self.mean_filter = self.create_mean_filter(im_channels, kernel_sym_size)
+        self.agg_filter = self.create_mean_filter(im_channels, kernel_sym_size)
 
     @staticmethod
-    def create_mean_filter(channels, kernel_sym_size, learnable):
+    def create_mean_filter(channels, kernel_sym_size):
         fil = nn.Conv2d(
             channels,
             channels,
@@ -94,22 +89,26 @@ class GuidedFilter(nn.Module):
             bias=False,
             padding=kernel_sym_size // 2,
         )
-        fil.requires_grad_(learnable)
+        fil.requires_grad_(False)
         nn.init.constant_(fil.weight, 1.0 / kernel_sym_size ** 2)
         return fil
 
     def __call__(self, im_p: torch.Tensor, im_I: torch.Tensor, gt: torch.Tensor = None):
         guide = im_I
-        self._compute_closed_form_solution(im_p, guide)
+        self._compute_closed_form_solution(im_p, im_I)
+        gt = im_p if gt is None else gt
         learnable_params = [x for x in self.parameters() if x.requires_grad]
-        if gt is not None and learnable_params:
+        if learnable_params:
             opt = torch.optim.Adam(learnable_params, lr=3e-4)
             pbar = tqdm(range(self.num_iter))
             for i in pbar:
                 guide = self.guide_encoder(im_I)
                 pred = self.pred(guide)
-                loss = torch.nn.functional.l1_loss(pred, gt)
-                pbar.set_description(f"L1 loss: {loss}")
+                l1_loss = nn.functional.l1_loss(pred, gt)
+                ds_pred = nn.functional.interpolate(pred, (self.H // 2, self.W // 2))
+                tv_loss = self.tv_loss(ds_pred, 0.25)
+                loss = l1_loss + tv_loss
+                pbar.set_description(f"L1 loss: {l1_loss}")
                 loss.backward()
                 opt.step()
                 opt.zero_grad()
@@ -153,10 +152,16 @@ class GuidedFilter(nn.Module):
         )
         return torch.mean(loss)
 
-    def pred(self, im_I):
-        a = self._a.unsqueeze(0).expand_as(im_I)
-        b = self._b.unsqueeze(0).expand_as(im_I)
-        return self.agg_filter(a) * im_I + self.agg_filter(b)
+    @staticmethod
+    def tv_loss(pred, weight):
+        tv_h = ((pred[:, :, 1:, :] - pred[:, :, :-1, :]).pow(2)).mean()
+        tv_w = ((pred[:, :, :, 1:] - pred[:, :, :, :-1]).pow(2)).mean()
+        return weight * (tv_h + tv_w)
+
+    def pred(self, guide):
+        a = self._a.unsqueeze(0).expand_as(guide)
+        b = self._b.unsqueeze(0).expand_as(guide)
+        return self.agg_filter(a) * guide + self.agg_filter(b)
 
 
 def vis_show(x: torch.Tensor, title: str = "", bound: int = 0):
@@ -182,10 +187,10 @@ if __name__ == "__main__":
     gf = GuidedFilter(
         SHAPE,
         eps=1e-5,
-        kernel_sym_size=9,
+        kernel_sym_size=15,
         num_iter=1000,
         guide_learnable=True,
-        a_b_learnable=True,
+        a_b_learnable=False,
     ).to(device)
 
     im_transform = T.Compose(
